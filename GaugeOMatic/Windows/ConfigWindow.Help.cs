@@ -24,7 +24,7 @@ public partial class ConfigWindow
         {
             AboutTab();
             HowToTab();
-            ConditionSetsTab(); // minimal addition: global QoLBar condition set editor + diagnostics
+            ConditionSetsTab(); // minimal addition: global QoLBar condition set editor
         }
     }
 
@@ -152,22 +152,6 @@ public partial class ConfigWindow
         ImGui.TextWrapped("If you use QoLBar's condition set feature, you can assign a condition set to trackers " +
                           "so they only show when the chosen QoLBar set is active. Use the controls below to apply a selected " +
                           "condition set globally (to all trackers) or to the currently selected job tab.");
-
-        ImGui.Spacing();
-
-        // DIAGNOSTIC STATUS (minimal, non-invasive)
-        try
-        {
-            var enabled = QoLBarIPC.QoLBarEnabled;
-            var ipcVer = QoLBarIPC.QoLBarIPCVersion;
-            var ver = QoLBarIPC.QoLBarVersion;
-            var setsDiag = QoLBarIPC.GetConditionSets() ?? Array.Empty<string>();
-            ImGui.TextDisabled($"QoLBarEnabled: {enabled}  IPCVer: {ipcVer}  QoLBarVer: {ver}  ConditionSetsCount: {setsDiag.Length}");
-        }
-        catch
-        {
-            ImGui.TextDisabled("QoLBar IPC diagnostic: error reading IPC state.");
-        }
 
         ImGui.Spacing();
 

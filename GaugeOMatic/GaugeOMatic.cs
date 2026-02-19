@@ -28,6 +28,14 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
     private IDalamudPluginInterface PluginInterface { get; init; }
     private TrackerManager TrackerManager { get; init; }
 
+    // One-time flag so we initialize QoLBarIPC only once on first Draw
+    private bool _qolBarInitDone = false;
+
+    // Polling state for re-evaluating QoLBar presence
+    private bool _qolBarPolling = false;
+    private DateTime _qolBarPollStart;
+    private DateTime _qolBarLastCheck;
+
     public GaugeOMatic(IDalamudPluginInterface pluginInterface)
     {
         PluginInterface = pluginInterface;
@@ -37,10 +45,9 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         Configuration.Initialize(PluginInterface);
 
-        // Initialize QoLBar IPC and pass handlers to update saved condition-set indices
-        QoLBarIPC.Initialize(pluginInterface, OnQoLBarMovedConditionSet, OnQoLBarRemovedConditionSet);
-
+        // Defer QoLBar IPC initialization to the first UI draw.
         PluginInterface.UiBuilder.Draw += DrawWindows;
+        PluginInterface.UiBuilder.Draw += OnFirstDraw;
         PluginInterface.UiBuilder.OpenConfigUi += OpenConfigWindow;
 
         BuildWidgetList();
@@ -57,6 +64,92 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
         Framework.Update += UpdatePlayerData;
 
         CommandManager.AddHandler(CommandName, new(OnCommand) { HelpMessage = "Open Gauge-O-Matic Settings" });
+    }
+
+    // Called on every UI draw; use it once to initialize QoLBar IPC and then set up short polling if needed.
+    private void OnFirstDraw()
+    {
+        if (_qolBarInitDone) return;
+
+        try
+        {
+            QoLBarIPC.Initialize(PluginInterface,
+                onMoved: OnQoLBarMovedConditionSet,
+                onRemoved: OnQoLBarRemovedConditionSet,
+                logger: msg => { try { Service.Log.Debug($"QoLBarIPC: {msg}"); } catch { } });
+        }
+        catch (Exception e)
+        {
+            try { Service.Log.Error($"QoLBarIPC initialization failed: {e}"); } catch { }
+        }
+
+        // Immediately re-evaluate and log
+        try
+        {
+            var enabled = QoLBarIPC.Reevaluate(
+                logger: msg => { try { Service.Log.Debug($"QoLBarIPC: {msg}"); } catch { } },
+                onEnabledChanged: en => { try { Service.Log.Information($"QoLBar enabled changed: {en}"); } catch { } });
+
+            Service.Log.Information("QoLBarIPC initial: Enabled={Enabled} IPCVer={IPCVer} QoLBarVer={QoLBarVer} Sets={Sets}",
+                QoLBarIPC.QoLBarEnabled,
+                QoLBarIPC.QoLBarIPCVersion,
+                QoLBarIPC.QoLBarVersion,
+                QoLBarIPC.GetConditionSets()?.Length ?? 0);
+
+            // If not enabled, start polling (short-lived) so toggles are detected even without Subscribe.
+            if (!enabled)
+            {
+                _qolBarPolling = true;
+                _qolBarPollStart = DateTime.UtcNow;
+                _qolBarLastCheck = DateTime.UtcNow.AddSeconds(-2); // allow immediate check
+                PluginInterface.UiBuilder.Draw += QolBarPollDraw;
+            }
+        }
+        catch (Exception e)
+        {
+            try { Service.Log.Error($"QoLBarIPC reeval failed: {e}"); } catch { }
+        }
+
+        _qolBarInitDone = true;
+        PluginInterface.UiBuilder.Draw -= OnFirstDraw;
+    }
+
+    // Poll every ~1s for up to 15s to catch QoLBar toggles when Subscribe isn't available.
+    private void QolBarPollDraw()
+    {
+        if (!_qolBarPolling) return;
+
+        var now = DateTime.UtcNow;
+        if ((now - _qolBarLastCheck).TotalSeconds < 1.0) return;
+
+        _qolBarLastCheck = now;
+
+        try
+        {
+            var prev = QoLBarIPC.QoLBarEnabled;
+            var curr = QoLBarIPC.Reevaluate(
+                logger: msg => { try { Service.Log.Debug($"QoLBarIPC: {msg}"); } catch { } },
+                onEnabledChanged: en => { try { Service.Log.Information($"QoLBar enabled changed: {en}"); } catch { } });
+
+            if (curr != prev)
+            {
+                // log already done in callback; also log summary
+                Service.Log.Information("QoLBarIPC poll detected change: Enabled={0}, IPCVer={1}, Sets={2}", curr, QoLBarIPC.QoLBarIPCVersion, QoLBarIPC.GetConditionSets()?.Length ?? 0);
+            }
+
+            // stop polling if enabled or timeout
+            if (curr || (now - _qolBarPollStart).TotalSeconds > 15)
+            {
+                _qolBarPolling = false;
+                PluginInterface.UiBuilder.Draw -= QolBarPollDraw;
+            }
+        }
+        catch (Exception e)
+        {
+            try { Service.Log.Error($"QoLBar poll error: {e}"); } catch { }
+            _qolBarPolling = false;
+            PluginInterface.UiBuilder.Draw -= QolBarPollDraw;
+        }
     }
 
     public void Dispose()

@@ -36,6 +36,7 @@ public abstract partial class Widget
 
     public void ApplyDisplayRules()
     {
+        // Added: Check QoLBar condition set configured on the tracker config (if any)
         if (!ClientState.IsPvP && TrackerConfig.CheckConditionSet() && (Tracker.UsePreviewValue || (CheckLevel() && CheckFlags())))
             Show();
         else
