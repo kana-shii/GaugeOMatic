@@ -58,8 +58,6 @@ public partial class ConfigWindow
         }
 
         if (UpdateFlag.HasFlag(UpdateFlags.Save)) trackerConfig.DisplayAttr = null;
-
-
     }
 
     private static void LayerControls(Tracker tracker, int hash, int index)
@@ -109,12 +107,32 @@ public partial class ConfigWindow
 
         void SettingsButton()
         {
-            if (!tracker.Available) IconButtonDisabled($"Settings{hash}", Cog);
-            else if (IconButton($"Settings{hash}", Cog) && tracker.Window != null)
+            // Make the settings (cog) button always clickable, even if the tracker is currently not Available.
+            if (IconButton($"Settings{hash}", Cog))
             {
-                tracker.Window.PositionCondition = ImGuiCond.FirstUseEver;
-                tracker.Window.IsOpen = !tracker.Window.IsOpen;
-                tracker.Window.Position = FindWindowPosition(tracker, index);
+                // Ensure a TrackerWindow exists for this tracker. If not, create one using the current
+                // tracker.Widget if present, otherwise create a temporary widget instance for the window.
+                try
+                {
+                    if (tracker.Window == null)
+                    {
+                        // Use the global namespace to resolve the Widget factory (prevents class/namespace collision).
+                        var widgetInstance = tracker.Widget ?? global::GaugeOMatic.Widgets.Widget.Create(tracker);
+                        var cfg = GaugeOMatic.ConfigWindow.Configuration;
+                        tracker.CreateWindow(widgetInstance, cfg);
+                    }
+
+                    if (tracker.Window != null)
+                    {
+                        tracker.Window.PositionCondition = ImGuiCond.FirstUseEver;
+                        tracker.Window.IsOpen = !tracker.Window.IsOpen;
+                        tracker.Window.Position = FindWindowPosition(tracker, index);
+                    }
+                }
+                catch
+                {
+                    // swallow and avoid throwing from the settings button
+                }
             }
 
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("Widget Settings");
@@ -147,7 +165,6 @@ public partial class ConfigWindow
         }
 
         if (ImGui.IsItemHovered()) ImGui.SetTooltip("Copy Widget Settings");
-
     }
 
     private static void PasteWidgetButton(Tracker tracker, int hash)
@@ -156,13 +173,17 @@ public partial class ConfigWindow
         {
             if (IconButton($"PasteWidget{hash}", PaintRoller))
             {
-                tracker.WidgetConfig = WidgetClipboard!;
+                tracker.TrackerConfig.WidgetConfig = WidgetClipboard!;
+                tracker.TrackerConfig.WidgetType = WidgetClipType;
                 UpdateFlag |= Reset | UpdateFlags.Save;
             }
 
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Paste Copied Settings");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("Paste Widget Settings");
         }
-        else IconButtonDisabled(PaintRoller);
+        else
+        {
+            IconButtonDisabled($"PasteWidget{hash}", PaintRoller);
+        }
     }
 
     private static void AddonDropdown(Tracker tracker, int hash)

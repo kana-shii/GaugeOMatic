@@ -32,9 +32,12 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
     // One-time flag so we initialize QoLBarIPC only once on first Draw
     private bool qolBarInitDone = false;
 
+    // Dispose guard
+    private bool disposed = false;
+
     // Polling state for QoLBar condition-set changes
-    private readonly Dictionary<int, bool> _qolConditionSetStates = new();
-    private DateTime _lastConditionPoll = DateTime.MinValue;
+    private readonly Dictionary<int, bool> qolConditionSetStates = new();
+    private DateTime lastConditionPoll = DateTime.MinValue;
     private static readonly TimeSpan ConditionPollInterval = TimeSpan.FromSeconds(1);
 
     public GaugeOMatic(IDalamudPluginInterface pluginInterface)
@@ -76,21 +79,24 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
             // Initialize QoLBar IPC using Cammy-style Initialize signature and forward events
             QoLBarIPC.Initialize(PluginInterface, OnQoLBarMovedConditionSet, OnQoLBarRemovedConditionSet);
 
-            // Subscribe to QoLBar enabled/disabled changes so we can rebuild trackers and apply rules
+            // Subscribe to QoLBar enabled/disabled changes — schedule heavy work on framework thread.
             QoLBarIPC.OnQoLBarEnabledChanged += enabled =>
             {
-                try
-                {
-                    Service.Log.Information($"QoLBar enabled changed: {enabled}");
-                }
-                catch { }
+                try { Service.Log.Information($"QoLBar enabled changed: {enabled}"); } catch { }
 
                 try
                 {
-                    // Rebuild trackers so ApplyDisplayRules runs and auto-disable logic runs immediately
-                    foreach (var jm in TrackerManager.JobModules) jm.RebuildTrackerList();
+                    // Schedule rebuild on framework thread to avoid native allocations on background threads
+                    Service.Framework.RunOnFrameworkThread(() =>
+                    {
+                        if (disposed) return;
+                        foreach (var jm in TrackerManager.JobModules) jm.RebuildTrackerList();
+                    });
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    try { Service.Log.Error($"Failed scheduling QoLBar rebuild: {ex}"); } catch { }
+                }
             };
         }
         catch (Exception e)
@@ -120,8 +126,8 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
     private void PollQoLConditionSets()
     {
         var now = DateTime.UtcNow;
-        if ((now - _lastConditionPoll) < ConditionPollInterval) return;
-        _lastConditionPoll = now;
+        if ((now - lastConditionPoll) < ConditionPollInterval) return;
+        lastConditionPoll = now;
 
         try
         {
@@ -151,9 +157,9 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
             foreach (var idx in indices)
             {
                 var current = QoLBarIPC.QoLBarEnabled && QoLBarIPC.CheckConditionSet(idx);
-                if (!_qolConditionSetStates.TryGetValue(idx, out var prev) || prev != current)
+                if (!qolConditionSetStates.TryGetValue(idx, out var prev) || prev != current)
                 {
-                    _qolConditionSetStates[idx] = current;
+                    qolConditionSetStates[idx] = current;
                     changedIndices.Add(idx);
                     Service.Log.Debug("QoLBar condition set {0} changed to {1}", idx, current);
                 }
@@ -162,13 +168,24 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
             if (changedIndices.Count > 0)
             {
                 // Apply persistent enable/disable changes based on which indices changed,
-                // then rebuild trackers once if anything changed.
+                // then schedule rebuild on framework thread if anything changed.
                 var anyConfigChanged = ApplyConditionSetStateChanges(changedIndices);
 
                 if (anyConfigChanged)
                 {
-                    foreach (var jm in TrackerManager.JobModules) jm.RebuildTrackerList();
-                    Service.Log.Information("QoLBar condition-set change triggered tracker rebuild");
+                    try
+                    {
+                        Service.Framework.RunOnFrameworkThread(() =>
+                        {
+                            if (disposed) return;
+                            foreach (var jm in TrackerManager.JobModules) jm.RebuildTrackerList();
+                        });
+                        Service.Log.Information("QoLBar condition-set change triggered tracker rebuild");
+                    }
+                    catch (Exception ex)
+                    {
+                        try { Service.Log.Error($"Failed scheduling rebuild after condition change: {ex}"); } catch { }
+                    }
                 }
             }
         }
@@ -245,6 +262,8 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
 
     public void Dispose()
     {
+        disposed = true;
+
         PluginInterface.UiBuilder.Draw -= DrawWindows;
         PluginInterface.UiBuilder.Draw -= PollQoLConditionSets;
         PluginInterface.UiBuilder.OpenConfigUi -= OpenConfigWindow;
@@ -289,8 +308,16 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
 
             Configuration.Save();
 
-            // Rebuild trackers so changes take effect immediately
-            foreach (var jm in TrackerManager.JobModules) jm.RebuildTrackerList();
+            // Schedule rebuild on framework thread
+            try
+            {
+                Service.Framework.RunOnFrameworkThread(() =>
+                {
+                    if (disposed) return;
+                    foreach (var jm in TrackerManager.JobModules) jm.RebuildTrackerList();
+                });
+            }
+            catch { }
         }
         catch { /* swallow errors to avoid breaking IPC callbacks */ }
     }
@@ -319,8 +346,16 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
 
             Configuration.Save();
 
-            // Rebuild trackers so changes take effect immediately
-            foreach (var jm in TrackerManager.JobModules) jm.RebuildTrackerList();
+            // Schedule rebuild on framework thread
+            try
+            {
+                Service.Framework.RunOnFrameworkThread(() =>
+                {
+                    if (disposed) return;
+                    foreach (var jm in TrackerManager.JobModules) jm.RebuildTrackerList();
+                });
+            }
+            catch { }
         }
         catch { /* swallow errors to avoid breaking IPC callbacks */ }
     }

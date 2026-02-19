@@ -61,24 +61,41 @@ public abstract partial class Tracker : IDisposable
         if (!TrackerConfig.Enabled) return;
 
         UpdateValues();
-        Widget = Widget.Create(this);
 
-        if (Widget != null)
+        // Defensive: widget creation can touch native nodes; wrap in try so it doesn't crash whole process.
+        try
         {
-            if (Window == null) CreateWindow(Widget, configuration);
-            else
-            {
-                if (!WindowSystem.Windows.Contains(Window)) WindowSystem.AddWindow(Window);
-                Window.Widget = Widget;
-            }
+            Widget = null;
+            Widget = Widget.Create(this);
 
-            Available = true;
+            if (Widget != null)
+            {
+                if (Window == null) CreateWindow(Widget, configuration);
+                else
+                {
+                    if (!WindowSystem.Windows.Contains(Window)) WindowSystem.AddWindow(Window);
+                    Window.Widget = Widget;
+                }
+
+                Available = true;
+            }
         }
+        catch (Exception e)
+        {
+            try { Service.Log.Error($"Widget creation failed for {TrackerConfig.TrackerType} item {TrackerConfig.ItemId}: {e}"); } catch { }
+            // Ensure we leave a clean state: no widget, not available.
+            Widget?.Dispose();
+            Widget = null;
+            Available = false;
+        }
+
         AddonDropdown.Prepare(addonOptions);
     }
 
-    public void CreateWindow(Widget widget, Configuration configuration)
+    // Accept nullable widget to avoid warnings when callers may pass null; do nothing in that case.
+    public void CreateWindow(Widget? widget, Configuration configuration)
     {
+        if (widget == null) return;
         Window = new(this, widget, configuration, $"{DisplayAttr.Name}##{GetHashCode()}");
         Window.Size = new(300, 600);
         WindowSystem.AddWindow(Window);
@@ -137,12 +154,31 @@ public abstract partial class Tracker : IDisposable
         return tracker;
     }
 
+    // Persist current widget config back into the tracker config.
     public void WriteWidgetConfig()
     {
-        Widget?.ApplyConfigs();
+        try
+        {
+            if (Widget == null) return;
+            Widget.ApplyConfigs();
 
-        typeof(WidgetConfig).GetProperties()
-                            .FirstOrDefault(prop => prop.PropertyType.Name == Widget?.Config.GetType().Name)?
-                            .SetValue(WidgetConfig, Widget?.Config);
+            // Find a property on the persisted WidgetConfig container that matches this widget's config type name,
+            // and set it to the widget's live config instance.
+            var liveTypeName = Widget.Config?.GetType().Name;
+            if (liveTypeName == null) return;
+
+            var prop = WidgetConfig.GetType()
+                                   .GetProperties()
+                                   .FirstOrDefault(p => p.PropertyType.Name == liveTypeName);
+
+            if (prop != null)
+            {
+                prop.SetValue(WidgetConfig, Widget.Config);
+            }
+        }
+        catch (Exception e)
+        {
+            try { Service.Log.Error($"WriteWidgetConfig failed for {TrackerConfig.TrackerType} item {TrackerConfig.ItemId}: {e}"); } catch { }
+        }
     }
 }

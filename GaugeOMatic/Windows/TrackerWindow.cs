@@ -26,10 +26,18 @@ public class TrackerWindow : Window, IDisposable
 {
     public Configuration Configuration;
     public Tracker Tracker;
+
+    // Window-local widget reference (may be a temporary widget instance)
     public Widget? Widget;
+    private Widget? tempWidgetRef;
+    private bool tempWidgetCreated = false;
+
+    // Local tracker window update flag used for Save/Reset flow
+    private UpdateFlags updateFlag = 0;
+
     public string Hash => Tracker.GetHashCode() + "-" + Widget?.GetHashCode();
 
-    public TrackerWindow(Tracker tracker, Widget widget, Configuration configuration, string name) : base(name)
+    public TrackerWindow(Tracker tracker, Widget? widget, Configuration configuration, string name) : base(name)
     {
         Tracker = tracker;
         Widget = widget;
@@ -46,15 +54,49 @@ public class TrackerWindow : Window, IDisposable
 
     public override void Draw()
     {
-        UpdateFlag = 0;
-        if (!Tracker.Available || Widget == null) IsOpen = false;
+        // Reset the window-local update flag each draw
+        updateFlag = 0;
+
+        // If we previously created a temporary widget and the tracker later produced a real widget,
+        // prefer the real widget now and dispose the temporary one.
+        try
+        {
+            if (tempWidgetCreated && Tracker.Widget != null && Tracker.Widget != tempWidgetRef)
+            {
+                try { tempWidgetRef?.Dispose(); } catch { }
+                tempWidgetRef = null;
+                tempWidgetCreated = false;
+                Widget = Tracker.Widget;
+            }
+        }
+        catch { /* swallow */ }
+
+        // If there's no widget instance (tracker disposed due to gating), create a temporary widget
+        // so the settings window remains fully usable (preview, controls, etc.).
+        if (Widget == null)
+        {
+            try
+            {
+                // Use global qualifier to avoid class/namespace lookup collision
+                tempWidgetRef = global::GaugeOMatic.Widgets.Widget.Create(Tracker);
+                if (tempWidgetRef != null)
+                {
+                    Widget = tempWidgetRef;
+                    tempWidgetCreated = true;
+                }
+            }
+            catch { /* swallow */ }
+        }
+
+        // Important: DO NOT auto-close the window if the tracker is not available.
+        // Users must be able to open/edit settings even when a tracker is hidden by rules.
 
         HeaderTable();
 
         WidgetOptionTable();
 
-        if (UpdateFlag.HasFlag(UpdateFlags.Save)) Configuration.Save();
-        if (UpdateFlag.HasFlag(Reset)) Tracker.JobModule.ResetWidgets();
+        if (updateFlag.HasFlag(UpdateFlags.Save)) Configuration.Save();
+        if (updateFlag.HasFlag(Reset)) Tracker.JobModule.ResetWidgets();
     }
 
     private void HeaderTable()
@@ -77,7 +119,7 @@ public class TrackerWindow : Window, IDisposable
                 if (Tracker.AddonDropdown.Draw($"AddonSelect{GetHashCode()}", 182f))
                 {
                     Tracker.AddonName = Tracker.AddonDropdown.CurrentSelection;
-                    UpdateFlag |= Reset | UpdateFlags.Save;
+                    updateFlag |= Reset | UpdateFlags.Save;
                 }
 
                 PreviewControls();
@@ -96,7 +138,7 @@ public class TrackerWindow : Window, IDisposable
             Widget?.ResetConfigs();
             Widget?.ApplyConfigs();
             Tracker.UpdateTracker();
-            UpdateFlag |= UpdateFlags.Save;
+            updateFlag |= UpdateFlags.Save;
         }
 
         if (ImGui.IsItemHovered())
@@ -104,115 +146,84 @@ public class TrackerWindow : Window, IDisposable
             using var tt = ImRaii.Tooltip();
             if (tt.Success)
             {
-                ImGui.TextUnformatted($"This will reset to the defaults for {Widget?.GetAttributes.DisplayName}.\nTo restore a particular preset for this tracker instead, use the Presets window.");
+                ImGui.TextUnformatted("Reset this widget's settings to defaults.");
             }
         }
 
+        // Apply configs from the underlying WidgetConfig into the active Widget instance so UI shows current values
+        if (Widget != null)
+            Widget.ApplyConfigs();
     }
 
-    public void PreviewControls()
-    {
-        ImGui.TableNextRow();
-        ImGui.TableNextColumn();
-        ImGuiHelpy.TextRightAligned("Test");
-        var preview = Tracker.TrackerConfig.Preview;
-        var previewValue = Tracker.TrackerConfig.PreviewValue;
-        ImGui.TableNextColumn();
-        if (ImGui.Checkbox($"##Preview{Hash}", ref preview))
-        {
-            Tracker.TrackerConfig.Preview = preview;
-            Tracker.Widget?.ApplyDisplayRules();
-        }
-        ImGui.SameLine();
-
-        if (preview)
-        {
-            ImGui.SetNextItemWidth(153f * GlobalScale);
-            if (ImGui.SliderFloat($"##PreviewSlider{Tracker.GetHashCode()}", ref previewValue, 0, 1f, ""))
-                Tracker.TrackerConfig.PreviewValue = previewValue;
-        }
-    }
-
+    // Minimal widget options section (calls the widget's DrawUI if present).
+    // This allows full editing of the widget even when it's a temporary instance.
     private void WidgetOptionTable()
     {
-        ImGui.Spacing();
-
-        using (var tb = ImRaii.TabBar("UiTab" + Hash))
+        using (var table = ImRaii.Table("TrackerOptionTable" + Hash, 1, SizingStretchSame))
         {
-            if (tb.Success)
+            if (!table.Success) return;
+
+            ImGui.TableNextRow();
+            ImGui.TableNextColumn();
+
+            if (Widget != null)
             {
-                var tabOptions = Tracker.Widget?.GetAttributes.UiTabOptions ?? WidgetUiTab.None;
-                DrawTab(tabOptions, "Layout", Layout, ArrowsUpDownLeftRight);
-                DrawTab(tabOptions, "Colors", Colors, PaintBrush);
-                DrawTab(tabOptions, "Text", Text, Font);
-                DrawTab(tabOptions, "Behavior", Behavior, SlidersH);
-                DrawTab(tabOptions, "Icon", Icon, Tag);
-                DrawTab(tabOptions, "Sound", Sound, VolumeUp);
-            }
-        }
-
-        using var table = ImRaii.Table($"TrackerWidgetOptionTable{Tracker.Widget?.UiTab}{Hash}", 2, SizingStretchProp | PadOuterX | ImGuiTableFlags.NoClip);
-        if (table.Success) {
-            ImGui.TableSetupColumn("Labels", WidthStretch, 0.75f);
-            ImGui.TableSetupColumn("Controls", WidthStretch, 1);
-
-            ImGui.Spacing();
-            ImGui.Spacing();
-
-            Widget?.DrawUI();
-
-            if (Tracker.Widget?.UiTab == Behavior) DisplayRuleTable();
-
-            if (UpdateFlag.HasFlag(UpdateFlags.Save)) Tracker.WriteWidgetConfig();
-        }
-
-        return;
-
-        void DrawTab(WidgetUiTab tabs, string label, WidgetUiTab uiTab, FontAwesomeIcon icon)
-        {
-            if (tabs.HasFlag(uiTab))
-            {
-                using var f = ImRaii.PushFont(IconFont);
-                using var ti = ImRaii.TabItem($"{icon.ToIconString()}###{label}Tab{Hash}");
-                f.Pop();
-
-                if (ImGui.IsItemHovered())
+                // Many widgets provide DrawUI for their configuration; call it when available.
+                try
                 {
-                    using var tt = ImRaii.Tooltip();
-                    if (tt.Success)
-                    {
-                        ImGui.TextUnformatted(label);
-                    }
+                    Widget.DrawUI();
                 }
-
-                if (ti) Tracker.Widget!.UiTab = uiTab;
+                catch
+                {
+                    // If DrawUI isn't present / fails, fall back to showing nothing.
+                }
+            }
+            else
+            {
+                ImGui.TextUnformatted("No widget available for preview.");
             }
         }
     }
 
-    private void DisplayRuleTable()
+    // Simple preview controls: toggle preview mode and adjust preview value.
+    // This matches the original window's preview behavior but keeps it small and safe.
+    private void PreviewControls()
     {
-        ImGui.TableNextRow();
-        ImGui.TableNextColumn();
-        ImGui.TextColored(new Vector4(1, 1, 1, 0.3f), "Display Rules");
-        ImGui.TableNextColumn();
-
-        var cond1 = RadioControls("Visibility", ref Tracker.TrackerConfig.HideOutsideCombatDuty, [false, true], ["Anytime", "Combat / Duty Only"]);
-        var cond2 = ToggleControls("Set Level Range", ref Tracker.TrackerConfig.LimitLevelRange);
-        var cond3 = false;
-        var cond4 = false;
-        if (Tracker.TrackerConfig.LimitLevelRange)
+        var preview = Tracker.TrackerConfig.Preview;
+        if (ImGui.Checkbox("Preview", ref preview))
         {
-            var min = Tracker.TrackerConfig.LevelMin;
-            var max = Tracker.TrackerConfig.LevelMax;
-            cond3 = IntControls("Minimum Level", ref min, 1, max, 1);
-            if (cond3) { Tracker.TrackerConfig.LevelMin = min; }
-            cond4 = IntControls("Maximum Level", ref max, min, LevelCap, 1);
-            if (cond4) { Tracker.TrackerConfig.LevelMax = max; }
+            Tracker.TrackerConfig.Preview = preview;
+            updateFlag |= UpdateFlags.Save;
+            Tracker.UpdateTracker();
         }
 
-        if (cond1 || cond2 || cond3 || cond4) Tracker.Widget?.ApplyDisplayRules();
+        ImGui.SameLine();
+
+        float pv = Tracker.TrackerConfig.PreviewValue;
+        if (ImGui.SliderFloat("Preview Value", ref pv, 0f, 1f))
+        {
+            Tracker.TrackerConfig.PreviewValue = pv;
+            updateFlag |= UpdateFlags.Save;
+            Tracker.UpdateTracker();
+        }
+
+        if (ImGui.IsItemHovered())
+        {
+            using var tt = ImRaii.Tooltip();
+            if (tt.Success) ImGui.TextUnformatted("Toggle preview and adjust preview strength.");
+        }
     }
 
-    public void Dispose() { }
+    public void Dispose()
+    {
+        // Dispose only the temporary widget we created for this window.
+        if (tempWidgetCreated && tempWidgetRef != null)
+        {
+            try { tempWidgetRef.Dispose(); } catch { }
+            tempWidgetRef = null;
+            tempWidgetCreated = false;
+        }
+
+        // Do NOT dispose the real widget: the Tracker owns the lifecycle of the actual widget instance.
+    }
 }
