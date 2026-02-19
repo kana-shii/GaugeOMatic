@@ -337,6 +337,9 @@ public sealed unsafe class SimpleGem(Tracker tracker) : FreeGemCounter(tracker)
                     if (!Config.HideEmpty && WidgetContainer.Alpha < 255) AllAppear();
                 }
                 break;
+            case Sound:
+                base.DrawUI();
+                break;
             default:
                 break;
         }
