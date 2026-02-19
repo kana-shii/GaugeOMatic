@@ -3,6 +3,13 @@ using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Components;
 using Dalamud.Bindings.ImGui;
 using static GaugeOMatic.Utility.ImGuiHelpy;
+using System;
+using System.Linq;
+using System.Numerics;
+using GaugeOMatic.Utility;
+using GaugeOMatic.Trackers;
+using static GaugeOMatic.GameData.JobData;
+using static Dalamud.Interface.Utility.ImGuiHelpers;
 
 namespace GaugeOMatic.Windows;
 
@@ -17,6 +24,7 @@ public partial class ConfigWindow
         {
             AboutTab();
             HowToTab();
+            ConditionSetsTab(); // minimal addition: global QoLBar condition set editor
         }
     }
 
@@ -128,8 +136,141 @@ public partial class ConfigWindow
             ImGuiComponents.IconButtonWithText(FontAwesomeIcon.Save,"Save##dummySave");
 
             ImGui.TextWrapped("If you've copied a preset from an external source to your clipboard, you can import it by clicking ");
-            ImGui.SameLine();
-            ImGuiComponents.IconButtonWithText(FontAwesomeIcon.SignInAlt,"Import From Clipboard##dummyImport");
         }
     }
+
+    // minimal additions start here
+    // Keeps currently selected index in the Condition Sets tab (0 = None, >0 = QoLBar set index+1)
+    private static int SelectedConditionSetIndex = 0;
+
+    private static void ConditionSetsTab()
+    {
+        using var ti = ImRaii.TabItem("Condition Sets");
+        if (!ti) return;
+
+        ImGui.Spacing();
+        ImGui.TextWrapped("If you use QoLBar's condition set feature, you can assign a condition set to trackers " +
+                          "so they only show when the chosen QoLBar set is active. Use the controls below to apply a selected " +
+                          "condition set globally (to all trackers) or to the currently selected job tab.");
+
+        ImGui.Spacing();
+
+        // Get condition set names from QoLBarIPC
+        var sets = QoLBarIPC.GetConditionSets() ?? Array.Empty<string>();
+
+        if (sets.Length == 0)
+        {
+            ImGui.TextDisabled("QoLBar not installed or no condition sets available.");
+            ImGui.Spacing();
+            ImGui.TextWrapped("Install QoLBar and create condition sets to use this feature. Trackers will remain unchanged until you assign a condition set.");
+            return;
+        }
+
+        // Build choices array: index 0 = "None", then QoLBar sets
+        var choices = new string[sets.Length + 1];
+        choices[0] = "None";
+        for (int i = 0; i < sets.Length; i++) choices[i + 1] = string.IsNullOrEmpty(sets[i]) ? $"Set {i}" : sets[i];
+
+        // Clamp selection
+        if (SelectedConditionSetIndex < 0) SelectedConditionSetIndex = 0;
+        if (SelectedConditionSetIndex > sets.Length) SelectedConditionSetIndex = sets.Length;
+
+        // Show combo
+        ImGui.SetNextItemWidth(400f * GlobalScale);
+        if (ImGui.Combo("Selected Condition Set", ref SelectedConditionSetIndex, choices, choices.Length))
+        {
+            // selection changed; wait for user to press Apply
+        }
+
+        ImGui.Spacing();
+
+        // Buttons row: Apply to All | Apply to Current Job | Clear All
+        if (ImGui.Button("Apply to All", new Vector2(160f * GlobalScale, 0)))
+        {
+            ApplyConditionSetToAll(SelectedConditionSetIndex - 1); // maps 0 -> -1 (None)
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Apply to Current Job", new Vector2(200f * GlobalScale, 0)))
+        {
+            ApplyConditionSetToCurrentJob(SelectedConditionSetIndex - 1);
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Clear All", new Vector2(120f * GlobalScale, 0)))
+        {
+            ApplyConditionSetToAll(-1);
+            SelectedConditionSetIndex = 0;
+        }
+
+        ImGui.Spacing();
+        ImGui.TextWrapped("Tip: You can also set condition sets per-tracker from the tracker's settings window. This global editor is for quick bulk changes.");
+    }
+
+    private static void ApplyConditionSetToAll(int conditionSetIndex)
+    {
+        try
+        {
+            var cfg = GaugeOMatic.ConfigWindow.Configuration;
+            if (cfg == null) return;
+
+            var tc = cfg.TrackerConfigs;
+            if (tc == null) return;
+
+            var props = tc.GetType().GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+            foreach (var prop in props)
+            {
+                if (prop.PropertyType != typeof(TrackerConfig[])) continue;
+                var arr = (TrackerConfig[]?)prop.GetValue(tc);
+                if (arr == null) continue;
+                foreach (var t in arr)
+                {
+                    if (t == null) continue;
+                    t.ConditionSet = conditionSetIndex;
+                }
+            }
+
+            cfg.Save();
+
+            // Rebuild trackers so changes take effect immediately
+            var tm = GaugeOMatic.ConfigWindow.TrackerManager;
+            if (tm != null)
+            {
+                foreach (var jm in tm.JobModules) jm.RebuildTrackerList();
+            }
+        }
+        catch
+        {
+            // swallow errors to avoid breaking UI
+        }
+    }
+
+    private static void ApplyConditionSetToCurrentJob(int conditionSetIndex)
+    {
+        try
+        {
+            var cfgWindow = GaugeOMatic.ConfigWindow;
+            var cfg = cfgWindow.Configuration;
+            if (cfg == null) return;
+
+            var jobTab = cfg.JobTab;
+            if (jobTab == Job.None) return;
+
+            // Find the job module matching the selected job tab
+            var jm = cfgWindow.JobModules.FirstOrDefault(m => m.Job == jobTab);
+            if (jm == null) return;
+
+            // Apply to that job's tracker configs
+            foreach (var tracker in jm.TrackerList)
+            {
+                tracker.TrackerConfig.ConditionSet = conditionSetIndex;
+            }
+
+            cfg.Save();
+            jm.RebuildTrackerList();
+        }
+        catch
+        {
+            // swallow
+        }
+    }
+    // minimal additions end here
 }
