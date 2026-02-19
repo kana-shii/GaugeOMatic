@@ -92,4 +92,13 @@ public class TrackerConfig
     // Returns true if no condition set is configured, or if QoLBar is enabled and the condition set is true.
     public bool CheckConditionSet()
         => ConditionSet < 0 || (QoLBarIPC.QoLBarEnabled && QoLBarIPC.CheckConditionSet(ConditionSet));
+
+    // Added: non-persisted runtime flag indicating we auto-disabled this tracker because of its condition set.
+    [JsonIgnore]
+    public bool AutoDisabledByConditionSet { get; set; } = false;
+
+    // Added: persisted storage of the previous Enabled state so we can restore it on re-enable.
+    // Nullable: null = no stored previous state; true/false = previous value to restore.
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore, DefaultValueHandling = DefaultValueHandling.Ignore)]
+    public bool? PrevEnabledBeforeConditionSet { get; set; } = null;
 }

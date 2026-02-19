@@ -6,6 +6,7 @@ using GaugeOMatic.Trackers;
 using GaugeOMatic.Windows;
 using GaugeOMatic.Utility;
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using static GaugeOMatic.GameData.ActionRef;
 using static GaugeOMatic.GameData.FrameworkData;
@@ -29,12 +30,12 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
     private TrackerManager TrackerManager { get; init; }
 
     // One-time flag so we initialize QoLBarIPC only once on first Draw
-    private bool _qolBarInitDone = false;
+    private bool qolBarInitDone = false;
 
-    // Polling state for re-evaluating QoLBar presence
-    private bool _qolBarPolling = false;
-    private DateTime _qolBarPollStart;
-    private DateTime _qolBarLastCheck;
+    // Polling state for QoLBar condition-set changes
+    private readonly Dictionary<int, bool> _qolConditionSetStates = new();
+    private DateTime _lastConditionPoll = DateTime.MinValue;
+    private static readonly TimeSpan ConditionPollInterval = TimeSpan.FromSeconds(1);
 
     public GaugeOMatic(IDalamudPluginInterface pluginInterface)
     {
@@ -45,7 +46,7 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         Configuration.Initialize(PluginInterface);
 
-        // Defer QoLBar IPC initialization to the first UI draw.
+        // Defer QoLBar IPC initialization to first UI draw (match Cammy timing)
         PluginInterface.UiBuilder.Draw += DrawWindows;
         PluginInterface.UiBuilder.Draw += OnFirstDraw;
         PluginInterface.UiBuilder.OpenConfigUi += OpenConfigWindow;
@@ -66,95 +67,186 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
         CommandManager.AddHandler(CommandName, new(OnCommand) { HelpMessage = "Open Gauge-O-Matic Settings" });
     }
 
-    // Called on every UI draw; use it once to initialize QoLBar IPC and then set up short polling if needed.
     private void OnFirstDraw()
     {
-        if (_qolBarInitDone) return;
+        if (qolBarInitDone) return;
 
         try
         {
-            QoLBarIPC.Initialize(PluginInterface,
-                onMoved: OnQoLBarMovedConditionSet,
-                onRemoved: OnQoLBarRemovedConditionSet,
-                logger: msg => { try { Service.Log.Debug($"QoLBarIPC: {msg}"); } catch { } });
+            // Initialize QoLBar IPC using Cammy-style Initialize signature and forward events
+            QoLBarIPC.Initialize(PluginInterface, OnQoLBarMovedConditionSet, OnQoLBarRemovedConditionSet);
+
+            // Subscribe to QoLBar enabled/disabled changes so we can rebuild trackers and apply rules
+            QoLBarIPC.OnQoLBarEnabledChanged += enabled =>
+            {
+                try
+                {
+                    Service.Log.Information($"QoLBar enabled changed: {enabled}");
+                }
+                catch { }
+
+                try
+                {
+                    // Rebuild trackers so ApplyDisplayRules runs and auto-disable logic runs immediately
+                    foreach (var jm in TrackerManager.JobModules) jm.RebuildTrackerList();
+                }
+                catch { }
+            };
         }
         catch (Exception e)
         {
-            try { Service.Log.Error($"QoLBarIPC initialization failed: {e}"); } catch { }
+            try { Service.Log.Error($"QoLBarIPC.Initialize threw: {e}"); } catch { }
         }
 
-        // Immediately re-evaluate and log
+        // Log immediate state so you can see whether it's detected
         try
         {
-            var enabled = QoLBarIPC.Reevaluate(
-                logger: msg => { try { Service.Log.Debug($"QoLBarIPC: {msg}"); } catch { } },
-                onEnabledChanged: en => { try { Service.Log.Information($"QoLBar enabled changed: {en}"); } catch { } });
-
             Service.Log.Information("QoLBarIPC initial: Enabled={Enabled} IPCVer={IPCVer} QoLBarVer={QoLBarVer} Sets={Sets}",
                 QoLBarIPC.QoLBarEnabled,
                 QoLBarIPC.QoLBarIPCVersion,
                 QoLBarIPC.QoLBarVersion,
                 QoLBarIPC.GetConditionSets()?.Length ?? 0);
-
-            // If not enabled, start polling (short-lived) so toggles are detected even without Subscribe.
-            if (!enabled)
-            {
-                _qolBarPolling = true;
-                _qolBarPollStart = DateTime.UtcNow;
-                _qolBarLastCheck = DateTime.UtcNow.AddSeconds(-2); // allow immediate check
-                PluginInterface.UiBuilder.Draw += QolBarPollDraw;
-            }
         }
-        catch (Exception e)
-        {
-            try { Service.Log.Error($"QoLBarIPC reeval failed: {e}"); } catch { }
-        }
+        catch { }
 
-        _qolBarInitDone = true;
+        // Start polling for condition-set changes by hooking a draw callback
+        PluginInterface.UiBuilder.Draw += PollQoLConditionSets;
+
+        qolBarInitDone = true;
         PluginInterface.UiBuilder.Draw -= OnFirstDraw;
     }
 
-    // Poll every ~1s for up to 15s to catch QoLBar toggles when Subscribe isn't available.
-    private void QolBarPollDraw()
+    // Poll every ~1s (draw callback) to detect QoLBar condition set activations.
+    private void PollQoLConditionSets()
     {
-        if (!_qolBarPolling) return;
-
         var now = DateTime.UtcNow;
-        if ((now - _qolBarLastCheck).TotalSeconds < 1.0) return;
-
-        _qolBarLastCheck = now;
+        if ((now - _lastConditionPoll) < ConditionPollInterval) return;
+        _lastConditionPoll = now;
 
         try
         {
-            var prev = QoLBarIPC.QoLBarEnabled;
-            var curr = QoLBarIPC.Reevaluate(
-                logger: msg => { try { Service.Log.Debug($"QoLBarIPC: {msg}"); } catch { } },
-                onEnabledChanged: en => { try { Service.Log.Information($"QoLBar enabled changed: {en}"); } catch { } });
+            // Collect all configured indices across tracker configs
+            var indices = new HashSet<int>();
+            var tc = Configuration.TrackerConfigs;
+            if (tc == null) return;
 
-            if (curr != prev)
+            var props = tc.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance);
+            foreach (var prop in props)
             {
-                // log already done in callback; also log summary
-                Service.Log.Information("QoLBarIPC poll detected change: Enabled={0}, IPCVer={1}, Sets={2}", curr, QoLBarIPC.QoLBarIPCVersion, QoLBarIPC.GetConditionSets()?.Length ?? 0);
+                if (prop.PropertyType != typeof(TrackerConfig[])) continue;
+                var arr = (TrackerConfig[]?)prop.GetValue(tc);
+                if (arr == null) continue;
+                foreach (var t in arr)
+                {
+                    if (t == null) continue;
+                    if (t.ConditionSet >= 0) indices.Add(t.ConditionSet);
+                }
             }
 
-            // stop polling if enabled or timeout
-            if (curr || (now - _qolBarPollStart).TotalSeconds > 15)
+            if (indices.Count == 0) return;
+
+            var changedIndices = new HashSet<int>();
+
+            // Check each index with QoLBarIPC and compare to cached state
+            foreach (var idx in indices)
             {
-                _qolBarPolling = false;
-                PluginInterface.UiBuilder.Draw -= QolBarPollDraw;
+                var current = QoLBarIPC.QoLBarEnabled && QoLBarIPC.CheckConditionSet(idx);
+                if (!_qolConditionSetStates.TryGetValue(idx, out var prev) || prev != current)
+                {
+                    _qolConditionSetStates[idx] = current;
+                    changedIndices.Add(idx);
+                    Service.Log.Debug("QoLBar condition set {0} changed to {1}", idx, current);
+                }
+            }
+
+            if (changedIndices.Count > 0)
+            {
+                // Apply persistent enable/disable changes based on which indices changed,
+                // then rebuild trackers once if anything changed.
+                var anyConfigChanged = ApplyConditionSetStateChanges(changedIndices);
+
+                if (anyConfigChanged)
+                {
+                    foreach (var jm in TrackerManager.JobModules) jm.RebuildTrackerList();
+                    Service.Log.Information("QoLBar condition-set change triggered tracker rebuild");
+                }
             }
         }
         catch (Exception e)
         {
-            try { Service.Log.Error($"QoLBar poll error: {e}"); } catch { }
-            _qolBarPolling = false;
-            PluginInterface.UiBuilder.Draw -= QolBarPollDraw;
+            try { Service.Log.Error($"QoLBar condition poll error: {e}"); } catch { }
         }
+    }
+
+    // Update TrackerConfig.Enabled / PrevEnabledBeforeConditionSet / AutoDisabledByConditionSet for trackers whose ConditionSet is in changedIndices.
+    // Returns true if any config was modified (so caller can save + rebuild).
+    private bool ApplyConditionSetStateChanges(HashSet<int> changedIndices)
+    {
+        var anyChange = false;
+        var tc = Configuration.TrackerConfigs;
+        if (tc == null) return false;
+
+        var props = tc.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance);
+        foreach (var prop in props)
+        {
+            if (prop.PropertyType != typeof(TrackerConfig[])) continue;
+            var arr = (TrackerConfig[]?)prop.GetValue(tc);
+            if (arr == null) continue;
+            foreach (var t in arr)
+            {
+                if (t == null) continue;
+                var idx = t.ConditionSet;
+                if (idx < 0 || !changedIndices.Contains(idx)) continue;
+
+                var active = QoLBarIPC.QoLBarEnabled && QoLBarIPC.CheckConditionSet(idx);
+
+                if (!active)
+                {
+                    // auto-disable if currently enabled and not already auto-disabled
+                    if (!t.AutoDisabledByConditionSet && t.Enabled)
+                    {
+                        t.AutoDisabledByConditionSet = true;
+                        if (t.PrevEnabledBeforeConditionSet == null)
+                            t.PrevEnabledBeforeConditionSet = t.Enabled;
+                        t.Enabled = false;
+                        anyChange = true;
+                        Service.Log.Debug("Auto-disabled tracker {0} (cond {1})", t.TrackerType, idx);
+                    }
+                }
+                else
+                {
+                    // condition set active: restore if we previously auto-disabled or we have a stored previous value
+                    if (t.AutoDisabledByConditionSet || t.PrevEnabledBeforeConditionSet.HasValue)
+                    {
+                        t.AutoDisabledByConditionSet = false;
+                        if (t.PrevEnabledBeforeConditionSet.HasValue)
+                        {
+                            t.Enabled = t.PrevEnabledBeforeConditionSet.Value;
+                            t.PrevEnabledBeforeConditionSet = null;
+                        }
+                        else
+                        {
+                            t.Enabled = true;
+                        }
+                        anyChange = true;
+                        Service.Log.Debug("Auto-reenabled tracker {0} (cond {1})", t.TrackerType, idx);
+                    }
+                }
+            }
+        }
+
+        if (anyChange)
+        {
+            try { Configuration.Save(); } catch { }
+        }
+
+        return anyChange;
     }
 
     public void Dispose()
     {
         PluginInterface.UiBuilder.Draw -= DrawWindows;
+        PluginInterface.UiBuilder.Draw -= PollQoLConditionSets;
         PluginInterface.UiBuilder.OpenConfigUi -= OpenConfigWindow;
         Framework.Update -= UpdatePlayerData;
 
@@ -196,6 +288,9 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
             }
 
             Configuration.Save();
+
+            // Rebuild trackers so changes take effect immediately
+            foreach (var jm in TrackerManager.JobModules) jm.RebuildTrackerList();
         }
         catch { /* swallow errors to avoid breaking IPC callbacks */ }
     }
@@ -223,6 +318,9 @@ public sealed partial class GaugeOMatic : IDalamudPlugin
             }
 
             Configuration.Save();
+
+            // Rebuild trackers so changes take effect immediately
+            foreach (var jm in TrackerManager.JobModules) jm.RebuildTrackerList();
         }
         catch { /* swallow errors to avoid breaking IPC callbacks */ }
     }
