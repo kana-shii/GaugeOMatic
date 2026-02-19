@@ -5,7 +5,7 @@ using Dalamud.Plugin.Ipc;
 namespace GaugeOMatic.Utility
 {
     // Cammy-style QoLBar IPC wrapper using ICallGateSubscriber<T...>
-    // Cached condition-sets kept so UI code can read names even when QoLBar is absent.
+    // Added: OnQoLBarEnabledChanged event so consumers can react when QoLBar enables/disables.
     public static class QoLBarIPC
     {
         public static bool QoLBarEnabled { get; private set; } = false;
@@ -21,9 +21,6 @@ namespace GaugeOMatic.Utility
 
         // Event invoked when QoLBarEnabled changes (true = enabled, false = disabled)
         public static event Action<bool>? OnQoLBarEnabledChanged;
-
-        // Cached condition sets (last successfully read from QoLBar). Use this when provider is unavailable.
-        private static string[] CachedConditionSets = Array.Empty<string>();
 
         public static int QoLBarIPCVersion
         {
@@ -43,38 +40,10 @@ namespace GaugeOMatic.Utility
             }
         }
 
-        // Return the last-known condition set names if the provider is missing/unavailable.
         public static string[] GetConditionSets()
         {
-            try
-            {
-                var live = qolBarGetConditionSetsProvider?.InvokeFunc();
-                if (live != null && live.Length > 0)
-                {
-                    CachedConditionSets = live;
-                    return live;
-                }
-            }
-            catch
-            {
-                // ignore and fall back to cached
-            }
-
-            return CachedConditionSets ?? Array.Empty<string>();
-        }
-
-        // Helper: safe name retrieval for a given index. Returns "[#] Unknown" when name not available.
-        public static string GetConditionSetName(int index)
-        {
-            if (index < 0) return "None";
-            var sets = GetConditionSets();
-            if (index >= 0 && index < sets.Length)
-            {
-                return $"[{index + 1}] {sets[index]}";
-            }
-
-            // If index present but we don't have a name, show numeric fallback
-            return $"[{index + 1}] (Unknown)";
+            try { return qolBarGetConditionSetsProvider?.InvokeFunc() ?? Array.Empty<string>(); }
+            catch { return Array.Empty<string>(); }
         }
 
         // Initialize exactly like Cammy: collect subscribers and subscribe.
@@ -130,9 +99,8 @@ namespace GaugeOMatic.Utility
             }
             catch { /* ignore */ }
 
-            // Attempt immediate enable and refresh cached sets if possible
+            // Attempt immediate enable if QoLBar already present
             EnableQoLBarIPC();
-            TryRefreshCachedConditionSets();
         }
 
         // Public so callers can force a check (same as Cammy)
@@ -144,7 +112,6 @@ namespace GaugeOMatic.Utility
                 if (!QoLBarEnabled)
                 {
                     QoLBarEnabled = true;
-                    try { TryRefreshCachedConditionSets(); } catch { }
                     try { OnQoLBarEnabledChanged?.Invoke(true); } catch { }
                 }
             }
@@ -174,23 +141,6 @@ namespace GaugeOMatic.Utility
         {
             try { return qolBarCheckConditionSetProvider?.InvokeFunc(i) ?? false; }
             catch { return false; }
-        }
-
-        // Attempt to refresh cachedConditionSets from the live provider, if available.
-        private static void TryRefreshCachedConditionSets()
-        {
-            try
-            {
-                var live = qolBarGetConditionSetsProvider?.InvokeFunc();
-                if (live != null && live.Length > 0)
-                {
-                    CachedConditionSets = live;
-                }
-            }
-            catch
-            {
-                // ignore failures, keep cached
-            }
         }
     }
 }
