@@ -36,7 +36,7 @@ public abstract partial class Widget
 
     public void ApplyDisplayRules()
     {
-        if (!ClientState.IsPvP && (Tracker.UsePreviewValue || (CheckLevel() && CheckFlags())))
+        if (!ClientState.IsPvP && TrackerConfig.CheckConditionSet() && (Tracker.UsePreviewValue || (CheckLevel() && CheckFlags())))
             Show();
         else
             Hide();

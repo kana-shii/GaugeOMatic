@@ -10,6 +10,7 @@ using static GaugeOMatic.GameData.JobData.Role;
 using static GaugeOMatic.GameData.ParamRef;
 using static GaugeOMatic.Widgets.WidgetAttribute;
 using static Newtonsoft.Json.JsonConvert;
+using GaugeOMatic.Utility;
 
 namespace GaugeOMatic.Trackers;
 
@@ -82,4 +83,13 @@ public class TrackerConfig
     public void DrawTooltip() => GetDisplayAttr().DrawTooltip(TrackerType, ItemId);
 
     [JsonIgnore] public string WidgetDisplayName => WidgetList.TryGetValue(WidgetType ?? string.Empty, out var result) ? result.DisplayName : "";
+
+    // Added: index of QoLBar condition set to use for this tracker.
+    // -1 = none (don't gate on QoLBar condition sets)
+    public int ConditionSet { get; set; } = -1;
+
+    // Added: helper to evaluate QoLBar condition set for this config.
+    // Returns true if no condition set is configured, or if QoLBar is enabled and the condition set is true.
+    public bool CheckConditionSet()
+        => ConditionSet < 0 || (QoLBarIPC.QoLBarEnabled && QoLBarIPC.CheckConditionSet(ConditionSet));
 }
